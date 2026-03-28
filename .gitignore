@@ -1,0 +1,9 @@
+config.py
+*.db
+*.csv
+*.xlsx
+results/*
+!results/.gitkeep
+__pycache__/
+*.pyc
+.DS_Store
