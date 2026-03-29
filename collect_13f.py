@@ -1,57 +1,100 @@
 #!/usr/bin/env python3
 """
-13F Data Collector
-==================
-Downloads 13F institutional holdings filings from SEC EDGAR and builds
-a database of new position initiations by quarter.
+13F Data Collector — v2 (Redesigned)
+======================================
+Downloads 13F institutional holdings from SEC EDGAR for a curated list
+of quality hedge funds (active stock-pickers only — no index managers).
 
-SEC EDGAR 13F data is freely available via the submissions API.
-Same pipeline as 8-K and Form 4 scanners.
-
-This is a long-running script -- collecting 28 quarters of 13F data
-from thousands of filers takes 2-4 hours. Run overnight.
+Key improvements over v1:
+  - Hedge fund filer list only (Vanguard/BlackRock/State Street/mutual funds removed)
+  - OpenFIGI CUSIP → ticker mapping (replaces broken stub from v1)
+  - ETF/fund filter: only 'Common Stock' holdings enter the backtest
+  - Two-phase collection: (1) raw holdings → (2) CUSIP map → (3) rebuild signals
+  - --reset flag wipes DB and rebuilds from scratch
 
 Usage:
-  python3 collect_13f.py              # Collect all quarters
-  python3 collect_13f.py --validate   # Show DB summary
-  python3 collect_13f.py --quarters 4 # Last 4 quarters only (fast test)
+  python3 collect_13f.py --reset             # Wipe DB and rebuild (START HERE)
+  python3 collect_13f.py --map-only          # Re-run CUSIP mapping on existing data
+  python3 collect_13f.py --validate          # Show DB summary only
+  python3 collect_13f.py --quarters 4        # Last 4 quarters only (fast test)
 """
 
 import sys
 import time
+import json
 import sqlite3
 import argparse
-import json
 import urllib.request
 import urllib.error
-from pathlib import Path
-from datetime import datetime, date
 import re
+from pathlib import Path
+from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent))
 import config as cfg
 
 SCRIPT_DIR = Path(__file__).parent
-DB_PATH = SCRIPT_DIR / cfg.THIRTEENF_DB
+DB_PATH    = SCRIPT_DIR / cfg.THIRTEENF_DB
+
+# ---------------------------------------------------------------------------
+# Filer universe — hedge funds and active managers ONLY
+# CIKs verified via SEC EDGAR submissions API.
+# To add more funds: look up CIK at https://www.sec.gov/cgi-bin/browse-edgar
+# ---------------------------------------------------------------------------
+
+HEDGE_FUND_FILERS = [
+    # Pure hedge funds — concentrated stock-pickers
+    ('0001067983', 'Berkshire Hathaway'),
+    ('0001336528', 'Citadel Advisors'),
+    ('0001423053', 'Renaissance Technologies'),
+    ('0001109357', 'Two Sigma Investments'),
+    ('0001061219', 'D.E. Shaw'),
+    ('0001603459', 'Viking Global Investors'),
+    ('0001456655', 'Coatue Management'),
+    ('0001502554', 'Lone Pine Capital'),
+    ('0001418819', 'Third Point LLC'),
+    ('0001037389', 'Pershing Square Capital'),
+    ('0001166408', 'Appaloosa Management'),
+    ('0001336917', 'Maverick Capital'),
+    ('0001326380', 'Greenlight Capital'),
+    ('0001045810', 'Soros Fund Management'),
+    ('0001365135', 'Balyasny Asset Management'),
+    ('0001541119', 'Millennium Management'),
+    ('0001543160', 'Point72 Asset Management'),
+    ('0001099590', 'AQR Capital Management'),
+    ('0001350487', 'Baupost Group'),
+    ('0001603869', 'Glenview Capital'),
+    ('0001159159', 'Paulson & Co'),
+    ('0001037540', 'Farallon Capital Management'),
+    ('0001582202', 'Bridgewater Associates'),
+    ('0001388838', 'Tiger Global Management'),
+    ('0000813672', 'Icahn Capital Management'),
+]
 
 
 # ---------------------------------------------------------------------------
 # Database setup
 # ---------------------------------------------------------------------------
 
-def create_database():
-    conn = sqlite3.connect(str(DB_PATH))
-    cur = conn.cursor()
+def create_database(reset=False):
+    if reset and DB_PATH.exists():
+        DB_PATH.unlink()
+        print(f'  Wiped existing DB: {DB_PATH.name}')
 
-    # Raw holdings per filer per quarter
+    conn = sqlite3.connect(str(DB_PATH))
+    cur  = conn.cursor()
+
+    # Raw holdings — one row per filer/quarter/cusip
     cur.execute("""
         CREATE TABLE IF NOT EXISTS holdings (
             filer_cik       TEXT NOT NULL,
+            filer_name      TEXT,
             quarter_end     TEXT NOT NULL,
             filing_date     TEXT NOT NULL,
-            ticker          TEXT,
-            cusip           TEXT,
+            cusip           TEXT NOT NULL,
             company_name    TEXT,
+            ticker          TEXT,
+            security_type   TEXT,
             value_usd       REAL,
             shares          INTEGER,
             is_new          INTEGER DEFAULT 0,
@@ -59,7 +102,18 @@ def create_database():
         )
     """)
 
-    # Aggregated initiation signals
+    # CUSIP lookup cache — persists across runs, never re-fetched
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS cusip_map (
+            cusip           TEXT PRIMARY KEY,
+            ticker          TEXT,
+            security_type   TEXT,
+            figi_name       TEXT,
+            mapped_at       TEXT
+        )
+    """)
+
+    # Aggregated initiation signals — rebuilt after every collection+mapping run
     cur.execute("""
         CREATE TABLE IF NOT EXISTS initiation_signals (
             ticker              TEXT NOT NULL,
@@ -72,112 +126,75 @@ def create_database():
         )
     """)
 
-    cur.execute('CREATE INDEX IF NOT EXISTS idx_holdings_ticker ON holdings(ticker)')
-    cur.execute('CREATE INDEX IF NOT EXISTS idx_holdings_quarter ON holdings(quarter_end)')
-    cur.execute('CREATE INDEX IF NOT EXISTS idx_signals_date ON initiation_signals(filing_date)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_holdings_ticker   ON holdings(ticker)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_holdings_quarter  ON holdings(quarter_end)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_holdings_filer    ON holdings(filer_cik)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_holdings_is_new   ON holdings(is_new)')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_signals_date      ON initiation_signals(filing_date)')
 
     conn.commit()
     return conn
 
 
 # ---------------------------------------------------------------------------
-# SEC EDGAR API
+# SEC EDGAR helpers
 # ---------------------------------------------------------------------------
 
 def sec_get(url, retries=3):
-    """SEC EDGAR GET with rate limiting and retry."""
     headers = {'User-Agent': cfg.SEC_USER_AGENT, 'Accept': 'application/json'}
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(url, headers=headers)
+            req  = urllib.request.Request(url, headers=headers)
             resp = urllib.request.urlopen(req, timeout=30)
             time.sleep(cfg.SEC_REQUEST_DELAY)
             return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                print(f'  Rate limited, waiting 60s...')
+                print('  Rate limited, sleeping 60s...')
                 time.sleep(60)
             elif e.code == 404:
                 return None
             else:
                 time.sleep(2 * (attempt + 1))
-        except Exception as e:
+        except Exception:
             time.sleep(2 * (attempt + 1))
     return None
 
 
-def get_13f_filers():
-    """Get list of large institutional 13F filers from SEC EDGAR company search."""
-    # Use SEC full-text search to find recent 13F-HR filers
-    url = 'https://efts.sec.gov/LATEST/search-index?q=%2213F-HR%22&dateRange=custom&startdt=2025-10-01&enddt=2026-02-01&forms=13F-HR&hits.hits._source=period_of_report,entity_name,file_num&hits.hits.total=true'
-
-    # Alternative: use the company tickers file to get CIKs, then filter for 13F filers
-    # More reliable approach: get from SEC submissions
-    url2 = 'https://data.sec.gov/submissions/CIK0001067983.json'  # Berkshire as test
-
-    # Best approach: use EDGAR full text search for 13F-HR filings
-    search_url = 'https://efts.sec.gov/LATEST/search-index?forms=13F-HR&dateRange=custom&startdt=2024-10-01&enddt=2025-02-28&hits.hits.total=true&hits.hits._source=cik,entity_name,period_of_report,filed_at'
-
-    data = sec_get(search_url)
-    if not data:
-        return []
-
-    filers = []
-    hits = data.get('hits', {}).get('hits', [])
-    for hit in hits:
-        src = hit.get('_source', {})
-        cik = src.get('cik', '')
-        name = src.get('entity_name', '')
-        if cik:
-            filers.append({'cik': cik.zfill(10), 'name': name})
-
-    return filers
-
-
-def get_filer_submissions(cik):
-    """Get all filings for a given CIK."""
-    url = f'https://data.sec.gov/submissions/CIK{cik}.json'
-    return sec_get(url)
-
-
 def get_quarterly_13f_filings(cik, num_quarters):
-    """Get the most recent N quarterly 13F filings for a CIK."""
-    submissions = get_filer_submissions(cik)
+    """Return the most recent N 13F-HR filings for a given CIK."""
+    url         = f'https://data.sec.gov/submissions/CIK{cik}.json'
+    submissions = sec_get(url)
     if not submissions:
         return []
 
-    recent = submissions.get('filings', {}).get('recent', {})
-    form_types = recent.get('form', [])
-    filing_dates = recent.get('filingDate', [])
+    recent         = submissions.get('filings', {}).get('recent', {})
+    form_types     = recent.get('form', [])
+    filing_dates   = recent.get('filingDate', [])
     accession_nums = recent.get('accessionNumber', [])
-    period_of_reports = recent.get('reportDate', [])
+    period_reports = recent.get('reportDate', [])
 
     filings = []
     for i, form in enumerate(form_types):
-        if form in ('13F-HR', '13F-HR/A') and i < len(accession_nums):
+        if form in ('13F-HR', '13F-HR/A'):
             filings.append({
-                'form': form,
-                'filing_date': filing_dates[i] if i < len(filing_dates) else '',
-                'accession': accession_nums[i].replace('-', ''),
-                'period': period_of_reports[i] if i < len(period_of_reports) else '',
+                'form':        form,
+                'filing_date': filing_dates[i]                         if i < len(filing_dates)   else '',
+                'accession':   accession_nums[i].replace('-', '')      if i < len(accession_nums) else '',
+                'period':      period_reports[i]                       if i < len(period_reports) else '',
             })
 
-    # Sort by filing date, take most recent N
     filings.sort(key=lambda x: x['filing_date'], reverse=True)
     return filings[:num_quarters]
 
 
 def parse_13f_xml(cik, accession):
-    """Parse 13F-HR XML to extract holdings."""
-    # Try to get the primary document index
-    acc_formatted = f'{accession[:10]}-{accession[10:12]}-{accession[12:]}'
-    index_url = f'https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/index.json'
-
+    """Fetch and parse the infotable XML from a 13F-HR filing."""
+    index_url  = f'https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/index.json'
     index_data = sec_get(index_url)
     if not index_data:
         return []
 
-    # Find the XML information table
     xml_file = None
     for item in index_data.get('directory', {}).get('item', []):
         name = item.get('name', '')
@@ -193,270 +210,387 @@ def parse_13f_xml(cik, accession):
     xml_url = f'https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{xml_file}'
     headers = {'User-Agent': cfg.SEC_USER_AGENT}
     try:
-        req = urllib.request.Request(xml_url, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=30)
+        req         = urllib.request.Request(xml_url, headers=headers)
+        resp        = urllib.request.urlopen(req, timeout=30)
         xml_content = resp.read().decode('utf-8', errors='ignore')
         time.sleep(cfg.SEC_REQUEST_DELAY)
     except Exception:
         return []
 
-    # Parse holdings from XML
     holdings = []
-    # Match infoTable entries
-    entries = re.findall(r'<infoTable>(.*?)</infoTable>', xml_content, re.DOTALL)
+    entries  = re.findall(r'<infoTable>(.*?)</infoTable>', xml_content, re.DOTALL)
+
     for entry in entries:
-        def get_val(tag, text):
-            m = re.search(f'<{tag}[^>]*>([^<]*)</{tag}>', text)
+        def get_val(tag, text=entry):
+            m = re.search(fr'<{tag}[^>]*>([^<]*)</{tag}>', text)
             return m.group(1).strip() if m else ''
 
-        name_of_issuer = get_val('nameOfIssuer', entry)
-        cusip = get_val('cusip', entry)
-        value_str = get_val('value', entry)
-        shares_str = re.search(r'<sshPrnamt[^>]*>([^<]*)</sshPrnamt>', entry)
-        ticker = ''  # 13F doesn't include ticker, we'll map from CUSIP later
+        cusip          = get_val('cusip')
+        name_of_issuer = get_val('nameOfIssuer')
+        value_str      = get_val('value')
+        shares_m       = re.search(r'<sshPrnamt[^>]*>([^<]*)</sshPrnamt>', entry)
 
         try:
-            value = float(value_str.replace(',', '')) * 1000 if value_str else 0  # values in thousands
+            # XML values are in $thousands — multiply to get actual dollars
+            value_usd = float(value_str.replace(',', '')) * 1000 if value_str else 0
         except ValueError:
-            value = 0
+            value_usd = 0
 
         try:
-            shares = int(shares_str.group(1).replace(',', '')) if shares_str else 0
+            shares = int(shares_m.group(1).replace(',', '')) if shares_m else 0
         except (ValueError, AttributeError):
             shares = 0
 
-        if cusip and value >= cfg.MIN_POSITION_VALUE / 1000:  # filter small positions
+        if cusip and value_usd >= cfg.MIN_POSITION_VALUE:
             holdings.append({
-                'cusip': cusip,
+                'cusip':        cusip,
                 'company_name': name_of_issuer,
-                'value_usd': value,
-                'shares': shares,
+                'value_usd':    value_usd,
+                'shares':       shares,
             })
 
     return holdings
 
 
 # ---------------------------------------------------------------------------
-# CUSIP to ticker mapping
+# OpenFIGI CUSIP -> ticker + security type mapping
 # ---------------------------------------------------------------------------
 
-_cusip_cache = {}
+def openfigi_batch(cusips):
+    """
+    Map up to 10 CUSIPs to tickers via OpenFIGI free API.
+    Returns: {cusip: {'ticker': str|None, 'security_type': str, 'name': str|None}}
 
-def cusip_to_ticker(cusip):
-    """Map CUSIP to ticker using SEC company tickers file."""
-    global _cusip_cache
-    if not _cusip_cache:
-        try:
-            url = 'https://www.sec.gov/files/company_tickers_exchange.json'
-            headers = {'User-Agent': cfg.SEC_USER_AGENT}
-            req = urllib.request.Request(url, headers=headers)
-            resp = urllib.request.urlopen(req, timeout=30)
-            data = json.loads(resp.read())
-            # Build CUSIP -> ticker lookup (partial match on first 8 chars)
-            for item in data.get('data', []):
-                # Format: [cik, name, ticker, exchange]
-                if len(item) >= 3:
-                    _cusip_cache[item[1].upper()[:8]] = item[2]
-            time.sleep(cfg.SEC_REQUEST_DELAY)
-        except Exception:
-            pass
-    # Try to match by company name prefix (imperfect but useful)
-    return None  # Return None -- we'll use company name as fallback
+    API docs: https://www.openfigi.com/api
+    Rate limits: 25 req/min (no key) / 250 req/min (with free API key)
+    No key required for basic use. Set OPENFIGI_API_KEY in config for higher limits.
+    """
+    url     = 'https://api.openfigi.com/v3/mapping'
+    payload = json.dumps([{'idType': 'ID_CUSIP', 'idValue': c} for c in cusips]).encode()
+    headers = {'Content-Type': 'application/json'}
+    if cfg.OPENFIGI_API_KEY:
+        headers['X-OPENFIGI-APIKEY'] = cfg.OPENFIGI_API_KEY
+
+    try:
+        req     = urllib.request.Request(url, data=payload, headers=headers, method='POST')
+        resp    = urllib.request.urlopen(req, timeout=30)
+        results = json.loads(resp.read())
+    except Exception as e:
+        print(f'    OpenFIGI error: {e}')
+        return {}
+
+    # US equity exchange codes
+    us_exchanges = {'US', 'UN', 'UW', 'UA', 'UR', 'UF'}
+
+    mapping = {}
+    for i, result in enumerate(results):
+        if i >= len(cusips):
+            break
+        cusip     = cusips[i]
+        data_list = result.get('data', [])
+
+        if not data_list:
+            mapping[cusip] = {
+                'ticker':        None,
+                'security_type': result.get('warning', 'No match'),
+                'name':          None,
+            }
+            continue
+
+        # Prefer US-listed Common Stock; fall back to first result
+        chosen = None
+        for item in data_list:
+            if (item.get('securityType') == 'Common Stock'
+                    and item.get('exchCode', '') in us_exchanges):
+                chosen = item
+                break
+        if not chosen:
+            chosen = data_list[0]
+
+        mapping[cusip] = {
+            'ticker':        chosen.get('ticker'),
+            'security_type': chosen.get('securityType'),
+            'name':          chosen.get('name'),
+        }
+
+    return mapping
+
+
+def build_cusip_map(conn):
+    """
+    Look up all unmapped CUSIPs in holdings via OpenFIGI.
+    Results cached in cusip_map table — idempotent, skips already-mapped CUSIPs.
+    After mapping, backfills ticker + security_type columns in holdings.
+    """
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT DISTINCT h.cusip
+        FROM   holdings h
+        LEFT   JOIN cusip_map m ON h.cusip = m.cusip
+        WHERE  m.cusip IS NULL
+    """)
+    unmapped = [r[0] for r in cur.fetchall()]
+
+    if not unmapped:
+        print('  All CUSIPs already mapped.')
+        _backfill_tickers(conn)
+        return
+
+    total      = len(unmapped)
+    batch_size = 10
+    delay      = cfg.OPENFIGI_REQUEST_DELAY
+    batches    = [unmapped[i:i + batch_size] for i in range(0, total, batch_size)]
+
+    api_note = 'with API key' if cfg.OPENFIGI_API_KEY else 'no API key — 25 req/min'
+    print(f'\n  Phase 2: CUSIP mapping ({api_note})')
+    print(f'  {total:,} unmapped CUSIPs  |  {len(batches)} requests  |  ~{len(batches) * delay / 60:.0f} min estimated')
+
+    mapped = 0
+    for i, batch in enumerate(batches, 1):
+        if i % 100 == 0 or i == len(batches):
+            print(f'    Batch {i}/{len(batches)} — {mapped} tickers resolved so far...', flush=True)
+
+        result = openfigi_batch(batch)
+        now    = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+        for cusip, info in result.items():
+            cur.execute("""
+                INSERT OR REPLACE INTO cusip_map
+                    (cusip, ticker, security_type, figi_name, mapped_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (cusip, info['ticker'], info['security_type'], info['name'], now))
+            if info['ticker']:
+                mapped += 1
+
+        conn.commit()
+        time.sleep(delay)
+
+    print(f'  Mapping complete: {mapped}/{total} CUSIPs resolved to tickers.')
+    _backfill_tickers(conn)
+
+
+def _backfill_tickers(conn):
+    """Backfill ticker + security_type into holdings from cusip_map."""
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE holdings
+        SET    ticker        = (SELECT ticker        FROM cusip_map WHERE cusip_map.cusip = holdings.cusip),
+               security_type = (SELECT security_type FROM cusip_map WHERE cusip_map.cusip = holdings.cusip)
+        WHERE  (ticker IS NULL OR ticker = '')
+    """)
+    conn.commit()
+    cur.execute("SELECT COUNT(*) FROM holdings WHERE ticker IS NOT NULL AND ticker != ''")
+    n = cur.fetchone()[0]
+    print(f'  Holdings backfilled: {n:,} rows now have a ticker.')
 
 
 # ---------------------------------------------------------------------------
-# Main collection logic
+# Collection logic
 # ---------------------------------------------------------------------------
-
-def get_large_filers_list():
-    """Get a list of well-known large institutional filers (CIKs)."""
-    # Hardcoded list of major institutional investors -- reliable and fast
-    # These are the filers whose 13F data matters most for signal quality
-    return [
-        ('0001067983', 'Berkshire Hathaway'),
-        ('0000102909', 'Vanguard Group'),
-        ('0000315066', 'BlackRock'),
-        ('0000093751', 'State Street'),
-        ('0001336528', 'Citadel Advisors'),
-        ('0001423053', 'Renaissance Technologies'),
-        ('0000088053', 'Goldman Sachs'),
-        ('0000895421', 'Morgan Stanley'),
-        ('0000019617', 'JPMorgan Chase'),
-        ('0000070858', 'Bank of America'),
-        ('0001109357', 'Two Sigma'),
-        ('0001582202', 'Bridgewater Associates'),
-        ('0001061219', 'D.E. Shaw'),
-        ('0000906107', 'Tiger Management'),
-        ('0001603459', 'Viking Global'),
-        ('0001456655', 'Coatue Management'),
-        ('0001502554', 'Lone Pine Capital'),
-        ('0001418819', 'Third Point'),
-        ('0001037389', 'Pershing Square'),
-        ('0001166408', 'Appaloosa Management'),
-        ('0001649289', 'Melvin Capital'),
-        ('0001336917', 'Maverick Capital'),
-        ('0001326380', 'Greenlight Capital'),
-        ('0001045810', 'Soros Fund Management'),
-        ('0001365135', 'Balyasny Asset Management'),
-        ('0001541119', 'Millennium Management'),
-        ('0001543160', 'Point72 Asset Management'),
-        ('0001099590', 'AQR Capital'),
-        ('0001061219', 'DE Shaw'),
-        ('0001035520', 'Fidelity'),
-        ('0001454939', 'T. Rowe Price'),
-        ('0000100885', 'Wellington Management'),
-        ('0000049196', 'Putnam Investments'),
-        ('0000807985', 'Capital Research'),
-        ('0000884905', 'Dodge & Cox'),
-        ('0001350487', 'Baupost Group'),
-        ('0001336528', 'Citadel'),
-        ('0001603869', 'Glenview Capital'),
-        ('0001159159', 'Paulson & Co'),
-        ('0001037540', 'Farallon Capital'),
-    ]
-
 
 def collect_quarter(conn, cik, filer_name, filing):
-    """Collect holdings for one filer, one quarter."""
-    accession = filing['accession']
-    period = filing['period']
+    """Collect and store all holdings for one filer, one quarter."""
+    accession   = filing['accession']
+    period      = filing['period']
     filing_date = filing['filing_date']
 
-    if not period or not filing_date:
+    if not period or not filing_date or not accession:
         return 0
 
-    # Check if already collected
     cur = conn.cursor()
-    cur.execute('SELECT COUNT(*) FROM holdings WHERE filer_cik=? AND quarter_end=?', (cik, period))
+    cur.execute(
+        'SELECT COUNT(*) FROM holdings WHERE filer_cik=? AND quarter_end=?',
+        (cik, period)
+    )
     if cur.fetchone()[0] > 0:
-        return 0  # Already have this quarter
+        return 0  # Already collected this quarter
 
     holdings = parse_13f_xml(cik, accession)
     if not holdings:
         return 0
 
-    # Get previous quarter holdings for this filer to identify new positions
+    # New initiation = CUSIP not seen in any prior quarter for this filer
     cur.execute("""
         SELECT DISTINCT cusip FROM holdings
-        WHERE filer_cik=? AND quarter_end < ?
-        ORDER BY quarter_end DESC
-        LIMIT 10000
+        WHERE filer_cik = ? AND quarter_end < ?
     """, (cik, period))
     prev_cusips = {r[0] for r in cur.fetchall()}
 
     inserted = 0
     for h in holdings:
-        cusip = h['cusip']
+        cusip  = h['cusip']
         is_new = 1 if cusip not in prev_cusips else 0
         cur.execute("""
             INSERT OR REPLACE INTO holdings
-            (filer_cik, quarter_end, filing_date, ticker, cusip, company_name, value_usd, shares, is_new)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (cik, period, filing_date, '', cusip, h['company_name'], h['value_usd'], h['shares'], is_new))
+                (filer_cik, filer_name, quarter_end, filing_date, cusip, company_name,
+                 ticker, security_type, value_usd, shares, is_new)
+            VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?, ?)
+        """, (cik, filer_name, period, filing_date, cusip,
+              h['company_name'], h['value_usd'], h['shares'], is_new))
         inserted += 1
 
     conn.commit()
     return inserted
 
 
+# ---------------------------------------------------------------------------
+# Signal rebuild
+# ---------------------------------------------------------------------------
+
 def rebuild_signals(conn):
-    """Rebuild the initiation_signals table from raw holdings."""
-    print('  Rebuilding initiation signals...')
+    """
+    Rebuild initiation_signals from holdings.
+    Only 'Common Stock' securities included — ETFs, mutual funds, preferreds excluded
+    via the security_type field populated by OpenFIGI.
+    """
+    print('\n  Phase 3: Rebuilding initiation signals (Common Stock only)...')
     cur = conn.cursor()
     cur.execute('DELETE FROM initiation_signals')
 
-    # Count new initiations per company name per quarter
     cur.execute("""
-        SELECT company_name, quarter_end,
-               MAX(filing_date) as filing_date,
-               SUM(is_new) as new_initiations,
-               COUNT(DISTINCT filer_cik) as total_holders,
-               SUM(value_usd) as total_value_usd
-        FROM holdings
-        WHERE is_new = 1
-        GROUP BY company_name, quarter_end
-        HAVING new_initiations >= ?
+        SELECT   ticker,
+                 quarter_end,
+                 MAX(filing_date)          AS filing_date,
+                 SUM(is_new)               AS new_initiations,
+                 COUNT(DISTINCT filer_cik) AS total_holders,
+                 SUM(value_usd)            AS total_value_usd
+        FROM     holdings
+        WHERE    is_new = 1
+          AND    ticker IS NOT NULL
+          AND    ticker != ''
+          AND    security_type = 'Common Stock'
+        GROUP BY ticker, quarter_end
+        HAVING   new_initiations >= ?
     """, (cfg.MIN_NEW_INITIATIONS,))
 
     rows = cur.fetchall()
     for row in rows:
-        company_name, quarter_end, filing_date, new_init, total_holders, total_value = row
-        # Use company name as ticker placeholder -- will need CUSIP->ticker mapping
-        # For now, try to extract a clean name
-        ticker = company_name[:20].strip() if company_name else ''
+        ticker, quarter_end, filing_date, new_init, total_holders, total_value = row
         cur.execute("""
             INSERT OR REPLACE INTO initiation_signals
-            (ticker, quarter_end, filing_date, new_initiations, total_holders, total_value_usd)
+                (ticker, quarter_end, filing_date, new_initiations, total_holders, total_value_usd)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (ticker, quarter_end, filing_date, new_init, total_holders, total_value))
 
     conn.commit()
-    print(f'  {len(rows)} initiation signals built')
+    print(f'  {len(rows)} initiation signals built.')
 
+
+# ---------------------------------------------------------------------------
+# DB validation summary
+# ---------------------------------------------------------------------------
 
 def validate_db(conn):
     cur = conn.cursor()
+
     cur.execute('SELECT COUNT(*) FROM holdings')
     total = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM holdings WHERE security_type = 'Common Stock'")
+    common = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*) FROM holdings
+        WHERE  security_type NOT IN ('Common Stock', '')
+          AND  security_type IS NOT NULL
+    """)
+    filtered = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM holdings WHERE ticker = '' OR ticker IS NULL")
+    unmapped_count = cur.fetchone()[0]
+
     cur.execute('SELECT COUNT(DISTINCT filer_cik) FROM holdings')
     filers = cur.fetchone()[0]
+
     cur.execute('SELECT COUNT(DISTINCT quarter_end) FROM holdings')
     quarters = cur.fetchone()[0]
-    cur.execute('SELECT COUNT(*) FROM initiation_signals')
-    signals = cur.fetchone()[0]
+
     cur.execute('SELECT MIN(quarter_end), MAX(quarter_end) FROM holdings')
     min_q, max_q = cur.fetchone()
 
-    print()
-    print('=' * 60)
-    print('  13F DATABASE SUMMARY')
-    print('=' * 60)
-    print(f'  Holdings records: {total:,}')
-    print(f'  Unique filers:    {filers}')
-    print(f'  Quarters covered: {quarters} ({min_q} to {max_q})')
-    print(f'  Init signals:     {signals:,}')
-    print('=' * 60)
+    cur.execute('SELECT COUNT(*) FROM cusip_map')
+    cusip_count = cur.fetchone()[0]
 
+    cur.execute('SELECT COUNT(*) FROM initiation_signals')
+    signals = cur.fetchone()[0]
+
+    print()
+    print('=' * 62)
+    print('  13F DATABASE SUMMARY (v2)')
+    print('=' * 62)
+    print(f'  Holdings total:           {total:>8,}')
+    print(f'  Common Stock (tradeable): {common:>8,}')
+    print(f'  ETF/fund filtered out:    {filtered:>8,}')
+    print(f'  Unmapped (no ticker):     {unmapped_count:>8,}')
+    print(f'  Unique filers:            {filers:>8}')
+    print(f'  Quarters covered:         {quarters:>8}  ({min_q} to {max_q})')
+    print(f'  CUSIP map entries:        {cusip_count:>8,}')
+    print(f'  Initiation signals:       {signals:>8,}')
+    print('=' * 62)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='13F Data Collector')
-    parser.add_argument('--validate', action='store_true')
-    parser.add_argument('--quarters', type=int, default=cfg.COLLECT_QUARTERS,
-                        help=f'Number of quarters to collect (default: {cfg.COLLECT_QUARTERS})')
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description='13F Data Collector v2')
+    p.add_argument('--reset',    action='store_true',
+                   help='Wipe DB and rebuild from scratch (required for first run)')
+    p.add_argument('--map-only', action='store_true',
+                   help='Skip collection; re-run CUSIP mapping on existing holdings')
+    p.add_argument('--validate', action='store_true',
+                   help='Show DB summary and exit')
+    p.add_argument('--quarters', type=int, default=cfg.COLLECT_QUARTERS,
+                   help=f'Quarters per filer (default: {cfg.COLLECT_QUARTERS})')
+    return p.parse_args()
 
 
 def main():
     args = parse_args()
-    conn = create_database()
+    conn = create_database(reset=args.reset)
 
     if args.validate:
         validate_db(conn)
         conn.close()
         return
 
-    filers = get_large_filers_list()
-    print(f'\n  Collecting 13F data for {len(filers)} institutional filers')
-    print(f'  Last {args.quarters} quarters per filer')
-    print(f'  This will take 1-3 hours -- run overnight')
+    if args.map_only:
+        print('\n  Skipping collection — running CUSIP mapping only.')
+        build_cusip_map(conn)
+        rebuild_signals(conn)
+        validate_db(conn)
+        conn.close()
+        return
+
+    # ---- Phase 1: Collect raw holdings ----
+    print(f'\n  Phase 1: Collecting 13F holdings')
+    print(f'  Filers:             {len(HEDGE_FUND_FILERS)} hedge funds (no index managers)')
+    print(f'  Quarters per filer: {args.quarters}')
+    print(f'  Min position value: ${cfg.MIN_POSITION_VALUE:,.0f}')
+    print(f'  Estimated runtime:  2-4 hours (run overnight)')
     print()
 
     total_records = 0
-    for i, (cik, name) in enumerate(filers, 1):
-        print(f'  [{i}/{len(filers)}] {name} (CIK: {cik})')
-
+    for i, (cik, name) in enumerate(HEDGE_FUND_FILERS, 1):
+        print(f'  [{i}/{len(HEDGE_FUND_FILERS)}] {name}  (CIK: {cik})')
         filings = get_quarterly_13f_filings(cik, args.quarters)
         if not filings:
             print(f'    No 13F filings found')
             continue
-
         for filing in filings:
             n = collect_quarter(conn, cik, name, filing)
             if n > 0:
                 print(f'    {filing["period"]}: {n} holdings')
                 total_records += n
 
-    print(f'\n  Collection complete. {total_records:,} holdings records.')
+    print(f'\n  Collection complete. {total_records:,} raw holdings records.')
+
+    # ---- Phase 2: CUSIP -> ticker mapping ----
+    build_cusip_map(conn)
+
+    # ---- Phase 3: Rebuild signals ----
     rebuild_signals(conn)
     validate_db(conn)
     conn.close()
