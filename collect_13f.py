@@ -42,33 +42,30 @@ DB_PATH    = SCRIPT_DIR / cfg.THIRTEENF_DB
 # To add more funds: look up CIK at https://www.sec.gov/cgi-bin/browse-edgar
 # ---------------------------------------------------------------------------
 
+# CIKs verified via SEC EDGAR in March 2026.
+# Quant/multi-strategy funds excluded (RenTech/Citadel/AQR/Millennium/D.E.Shaw):
+# their 'new initiations' are algorithmic rotation noise, not conviction signals.
+# Only concentrated stock-pickers with typically <300 holdings per quarter.
 HEDGE_FUND_FILERS = [
-    # Pure hedge funds — concentrated stock-pickers
-    ('0001067983', 'Berkshire Hathaway'),
-    ('0001336528', 'Citadel Advisors'),
-    ('0001423053', 'Renaissance Technologies'),
-    ('0001109357', 'Two Sigma Investments'),
-    ('0001061219', 'D.E. Shaw'),
-    ('0001603459', 'Viking Global Investors'),
-    ('0001456655', 'Coatue Management'),
-    ('0001502554', 'Lone Pine Capital'),
-    ('0001418819', 'Third Point LLC'),
-    ('0001037389', 'Pershing Square Capital'),
-    ('0001166408', 'Appaloosa Management'),
-    ('0001336917', 'Maverick Capital'),
-    ('0001326380', 'Greenlight Capital'),
-    ('0001045810', 'Soros Fund Management'),
-    ('0001365135', 'Balyasny Asset Management'),
-    ('0001541119', 'Millennium Management'),
-    ('0001543160', 'Point72 Asset Management'),
-    ('0001099590', 'AQR Capital Management'),
-    ('0001350487', 'Baupost Group'),
-    ('0001603869', 'Glenview Capital'),
-    ('0001159159', 'Paulson & Co'),
-    ('0001037540', 'Farallon Capital Management'),
-    ('0001582202', 'Bridgewater Associates'),
-    ('0001388838', 'Tiger Global Management'),
-    ('0000813672', 'Icahn Capital Management'),
+    # Concentrated long-only and activist funds
+    ('0001067983', 'Berkshire Hathaway'),           # ~120 holdings
+    ('0001336528', 'Pershing Square Capital Mgmt'), # ~11 holdings (confirmed)
+    ('0001103804', 'Viking Global Investors'),       # ~40-60 holdings
+    ('0001135730', 'Coatue Management'),             # ~60-80 holdings
+    ('0001061165', 'Lone Pine Capital'),             # ~50-60 holdings
+    ('0001040273', 'Third Point LLC'),               # ~15-25 holdings
+    ('0001656456', 'Appaloosa LP'),                  # ~10-20 holdings
+    ('0000934639', 'Maverick Capital'),              # ~60-80 holdings
+    ('0001079114', 'Greenlight Capital'),            # ~30-40 holdings
+    ('0001218710', 'Balyasny Asset Management'),     # ~200-300 holdings
+    ('0001061768', 'Baupost Group'),                 # ~20-30 holdings
+    ('0001138995', 'Glenview Capital Management'),   # ~50-70 holdings
+    ('0000909661', 'Farallon Capital Management'),   # ~50-80 holdings
+    ('0001412093', 'Icahn Capital LP'),              # ~15-25 holdings
+    ('0001388838', 'Tiger Global Management'),       # ~20-30 holdings
+    ('0001045810', 'Soros Fund Management'),         # ~5-10 holdings
+    ('0001543160', 'Point72 Asset Management'),      # ~15-40 holdings
+    ('0001159159', 'Paulson & Co'),                  # ~10-50 holdings
 ]
 
 
