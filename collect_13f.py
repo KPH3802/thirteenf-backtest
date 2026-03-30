@@ -43,7 +43,7 @@ DB_PATH    = SCRIPT_DIR / cfg.THIRTEENF_DB
 # ---------------------------------------------------------------------------
 
 # CIKs verified via SEC EDGAR in March 2026.
-# Quant/multi-strategy funds excluded (RenTech/Citadel/AQR/Millennium/D.E.Shaw):
+# Quant/multi-strategy funds excluded (RenTech/Citadel/AQR/Millennium/D.E.Shaw/Balyasny):
 # their 'new initiations' are algorithmic rotation noise, not conviction signals.
 # Only concentrated stock-pickers with typically <300 holdings per quarter.
 HEDGE_FUND_FILERS = [
@@ -53,15 +53,15 @@ HEDGE_FUND_FILERS = [
     ('0001103804', 'Viking Global Investors'),       # ~40-60 holdings
     ('0001135730', 'Coatue Management'),             # ~60-80 holdings
     ('0001061165', 'Lone Pine Capital'),             # ~50-60 holdings
-    ('0001040273', 'Third Point LLC'),               # ~15-25 holdings
+    ('0001040273', 'Third Point LLC'),               # ~15-25 holdings; stopped filing after Q1 2024
     ('0001656456', 'Appaloosa LP'),                  # ~10-20 holdings
     ('0000934639', 'Maverick Capital'),              # ~60-80 holdings
     ('0001079114', 'Greenlight Capital'),            # ~30-40 holdings
-    ('0001218710', 'Balyasny Asset Management'),     # ~200-300 holdings
+    # Balyasny removed: 1,250-3,526 positions/quarter (pod shop, not conviction-based)
     ('0001061768', 'Baupost Group'),                 # ~20-30 holdings
     ('0001138995', 'Glenview Capital Management'),   # ~50-70 holdings
     ('0000909661', 'Farallon Capital Management'),   # ~50-80 holdings
-    ('0001412093', 'Icahn Capital LP'),              # ~15-25 holdings
+    ('0000921669', 'Carl C. Icahn / Icahn Associates'), # ~15-25 holdings; corrected CIK (was 0001412093)
     ('0001388838', 'Tiger Global Management'),       # ~20-30 holdings
     ('0001045810', 'Soros Fund Management'),         # ~5-10 holdings
     ('0001543160', 'Point72 Asset Management'),      # ~15-40 holdings
